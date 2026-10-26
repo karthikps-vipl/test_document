@@ -1,0 +1,664 @@
+# Complete Step-by-Step Guide: Enable HTTPS on Spring Boot API Gateway
+
+For your architecture, we will configure **HTTPS only on the Spring Cloud API Gateway**. Your backend microservices will continue using HTTP, and both your Flutter Web and Flutter Mobile applications will connect to the Gateway over HTTPS.
+
+I'll assume you are using Windows for certificate preparation and Spring Boot on a Linux server, although the steps can also be used for local testing on Windows.
+
+## 1. Understand the final architecture
+
+```text
+       FLUTTER WEB APPLICATION
+                  |
+                  | HTTPS
+                  |
+                  v
+          TOMCAT WEB SERVER
+                  |
+                  | HTTPS (if proxying API requests)
+                  v
+       SPRING CLOUD API GATEWAY
+             Port 8443
+                  |
+         +--------+--------+
+         |        |        |
+        HTTP     HTTP     HTTP
+         |        |        |
+         v        v        v
+       Auth     Master   Other
+      Service  Service  Services
+       :8081    :8082    :8083
+
+
+       FLUTTER MOBILE APPLICATION
+                  |
+                  | HTTPS
+                  v
+       SPRING CLOUD API GATEWAY
+             Port 8443
+                  |
+                  | HTTP
+                  v
+          BACKEND MICROSERVICES
+```
+
+The ports are examples; use your actual service ports.
+
+**What we are going to do:**
+
+1. Obtain the existing certificate files.
+2. Check whether the certificate is suitable for the API Gateway.
+3. Install OpenSSL on Windows.
+4. Convert the certificate and private key into a PKCS12 keystore.
+5. Transfer the keystore securely to your Linux server.
+6. Configure HTTPS in the Gateway's `application.properties`.
+7. Keep backend services on HTTP.
+8. Configure Flutter to use the HTTPS Gateway URL.
+9. Test the complete communication.
+
+---
+
+# Step 1: Collect the Existing Certificate Files
+
+You mentioned that another PC has these files:
+
+```text
+frontend.crt
+frontend.key
+ca.crt
+```
+
+Obtain the files from that PC through an authorized, secure transfer method.
+
+Create a directory on your Windows PC:
+
+```text
+C:\certs\
+```
+
+Copy the required files into it:
+
+```text
+C:\certs\frontend.crt
+C:\certs\frontend.key
+C:\certs\ca.crt
+```
+
+### Understand the files
+
+| File | Purpose |
+|---|---|
+| `frontend.crt` | Public certificate |
+| `frontend.key` | Private key corresponding to the certificate |
+| `ca.crt` | CA certificate, if one was generated or supplied |
+
+Keep `frontend.key` confidential. Do not send it through public messaging channels, commit it to Git, or include it in your application source code.
+
+**Important:** Do not assume `ca.crt` is necessarily the issuing CA certificate. We will inspect the files before deciding how to use them.
+
+---
+
+# Step 2: Install OpenSSL on Windows
+
+Open **Command Prompt** and execute:
+
+```cmd
+openssl version
+```
+
+If OpenSSL is installed and configured correctly, you should see a version such as:
+
+```text
+OpenSSL 3.x.x
+```
+
+The exact version may differ.
+
+### If OpenSSL is not installed
+
+Install a trusted Windows-compatible OpenSSL distribution, following its official installation instructions.
+
+After installation, open a new Command Prompt and run:
+
+```cmd
+openssl version
+```
+
+If the command is still not recognized, add the directory containing `openssl.exe` to your Windows `PATH`, then reopen the terminal.
+
+### Verify the files
+
+Run:
+
+```cmd
+dir C:\certs
+```
+
+Confirm that the certificate and key files are present before continuing.
+
+---
+
+# Step 3: Inspect the Certificate Before Using It
+
+This is a critical step because the existing certificate may have been generated for the frontend rather than the API Gateway.
+
+### 3.1 Check the certificate details
+
+Run in Windows Command Prompt:
+
+```cmd
+openssl x509 -in C:\certs\frontend.crt -noout -subject -issuer -dates
+```
+
+This displays:
+
+- Subject: the identity associated with the certificate.
+- Issuer: the entity that issued it.
+- Not Before: the beginning of its validity period.
+- Not After: its expiration date.
+
+### 3.2 Check the hostname
+
+Run:
+
+```cmd
+openssl x509 -in C:\certs\frontend.crt -noout -ext subjectAltName
+```
+
+Example output:
+
+```text
+X509v3 Subject Alternative Name:
+    DNS:app.example.internal, DNS:localhost
+```
+
+Suppose your Flutter applications will call:
+
+```text
+https://api.example.internal:8443
+```
+
+The certificate must cover `api.example.internal`.
+
+If it covers only `app.example.internal`, **do not use it for the Gateway**. Ask the server team to issue a certificate for the API hostname.
+
+If you will access the Gateway through an IP address, the certificate needs a matching IP address in its Subject Alternative Name. A DNS entry is not equivalent to an IP SAN.
+
+### 3.3 Check whether the certificate and CA files are self-signed
+
+Run:
+
+```cmd
+openssl x509 -in C:\certs\frontend.crt -noout -subject -issuer
+```
+
+Then:
+
+```cmd
+openssl x509 -in C:\certs\ca.crt -noout -subject -issuer
+```
+
+If `frontend.crt` has the same subject and issuer, it may be self-signed. If `ca.crt` has the same subject and issuer, it may also be self-signed.
+
+These comparisons are clues, not complete verification. A certificate can be self-issued without being self-signed.
+
+For a self-signed certificate, you generally need to distribute and trust the appropriate certificate on clients. For a certificate issued by a private CA, clients should trust the appropriate CA certificate.
+
+**Do not continue until you confirm that the certificate is valid for the hostname you intend to use.**
+
+---
+
+# Step 4: Convert the Certificate into a PKCS12 Keystore
+
+Spring Boot can use a PKCS12 keystore containing the server certificate and its corresponding private key.
+
+We'll create:
+
+```text
+C:\certs\gateway.p12
+```
+
+### 4.1 Convert the files
+
+If `frontend.crt` is the correct certificate for the Gateway and `frontend.key` is its matching private key, run:
+
+```cmd
+openssl pkcs12 -export -in C:\certs\frontend.crt -inkey C:\certs\frontend.key -out C:\certs\gateway.p12 -name gateway
+```
+
+OpenSSL will ask you to enter and confirm an export password.
+
+Use a strong password and store it securely. You will need it when configuring Spring Boot.
+
+### 4.2 What if `ca.crt` is an intermediate certificate?
+
+If the certificate was issued by a CA and the server needs to present intermediate certificates, include the appropriate intermediate chain when creating the keystore.
+
+For example:
+
+```cmd
+openssl pkcs12 -export -in C:\certs\frontend.crt -inkey C:\certs\frontend.key -certfile C:\certs\ca-chain.crt -out C:\certs\gateway.p12 -name gateway
+```
+
+Here, `ca-chain.crt` is an illustrative filename for the appropriate intermediate chain. Do not blindly substitute `ca.crt`: it may be a root certificate, an issuing CA certificate, or something else.
+
+If you have a simple self-signed server certificate, the first conversion command may be sufficient.
+
+### 4.3 Verify the keystore
+
+Run:
+
+```cmd
+openssl pkcs12 -info -in C:\certs\gateway.p12 -noout
+```
+
+Enter the export password when prompted.
+
+Confirm that OpenSSL can read the keystore and that it contains the expected certificate and private-key information.
+
+**At this point, your Windows PC has prepared the keystore. You do not need to regenerate the certificate just because your Spring Boot application runs on Linux.**
+
+---
+
+# Step 5: Transfer the Keystore to Your Linux Server
+
+Assume your Spring Boot API Gateway runs on an Ubuntu server.
+
+You can transfer the file using an approved secure transfer method, such as SCP over SSH.
+
+For example, from Windows PowerShell:
+
+```powershell
+scp C:\certs\gateway.p12 username@YOUR_SERVER_IP:/home/username/
+```
+
+Replace:
+
+- `username` with your Linux username.
+- `YOUR_SERVER_IP` with your actual server IP address.
+
+If SCP is unavailable on Windows, use your organization's approved secure file-transfer method.
+
+### 5.1 Create the certificate directory on Linux
+
+Log in to the server:
+
+```bash
+ssh username@YOUR_SERVER_IP
+```
+
+Then create the directory:
+
+```bash
+sudo mkdir -p /etc/myapp/certs
+```
+
+Move the transferred keystore into the directory:
+
+```bash
+sudo mv /home/username/gateway.p12 /etc/myapp/certs/gateway.p12
+```
+
+Restrict its permissions:
+
+```bash
+sudo chmod 600 /etc/myapp/certs/gateway.p12
+```
+
+Set the file owner to the Linux account that runs your Spring Boot application:
+
+```bash
+sudo chown APP_USER:APP_GROUP /etc/myapp/certs/gateway.p12
+```
+
+Replace `APP_USER` and `APP_GROUP` with the actual account and group. The application must be able to read the keystore.
+
+If you do not know which account runs your application, check your service configuration or running process before changing ownership.
+
+---
+
+# Step 6: Configure HTTPS in the API Gateway
+
+Now configure Spring Boot.
+
+Open the API Gateway project's:
+
+```text
+src/main/resources/application.properties
+```
+
+Add the following properties:
+
+```properties
+# ==========================================
+# API Gateway
+# ==========================================
+spring.application.name=api-gateway
+
+# ==========================================
+# HTTPS Configuration
+# ==========================================
+server.port=8443
+server.ssl.enabled=true
+
+server.ssl.key-store=file:/etc/myapp/certs/gateway.p12
+server.ssl.key-store-type=PKCS12
+server.ssl.key-store-password=${GATEWAY_KEYSTORE_PASSWORD}
+server.ssl.key-alias=gateway
+
+server.ssl.enabled-protocols=TLSv1.3,TLSv1.2
+```
+
+### What these properties do
+
+| Property | Purpose |
+|---|---|
+| `server.port=8443` | Runs the Gateway on port 8443 |
+| `server.ssl.enabled=true` | Enables HTTPS |
+| `server.ssl.key-store` | Specifies the keystore location |
+| `server.ssl.key-store-type=PKCS12` | Identifies the keystore format |
+| `server.ssl.key-store-password` | Reads the keystore password from the environment |
+| `server.ssl.key-alias` | Selects the Gateway certificate entry |
+| `server.ssl.enabled-protocols` | Enables TLS 1.2 and TLS 1.3 |
+
+Keep your existing Gateway discovery, security, and route properties. Add the SSL properties rather than replacing your entire configuration file.
+
+### Set the keystore password
+
+For a quick test, you can set the environment variable in the terminal before starting the Gateway:
+
+```bash
+export GATEWAY_KEYSTORE_PASSWORD='YOUR_ACTUAL_KEYSTORE_PASSWORD'
+```
+
+Then launch the application from that same terminal.
+
+**Important:** This environment variable is temporary. It will not automatically persist after you close the terminal or restart the server.
+
+For a production deployment, configure the password using your approved secrets mechanism or a protected environment file for the Gateway's systemd service.
+
+Do not put the actual password in Git.
+
+---
+
+# Step 7: Configure the Gateway to Forward Requests over HTTP
+
+Since you want your microservices to remain on HTTP, the Gateway routes should continue to use HTTP backend URLs.
+
+For example, if your services run on the same server:
+
+```properties
+# Auth Service
+spring.cloud.gateway.routes[0].id=auth-service
+spring.cloud.gateway.routes[0].uri=http://127.0.0.1:8081
+spring.cloud.gateway.routes[0].predicates[0]=Path=/authService/**
+
+# Master Service
+spring.cloud.gateway.routes[1].id=master-service
+spring.cloud.gateway.routes[1].uri=http://127.0.0.1:8082
+spring.cloud.gateway.routes[1].predicates[0]=Path=/masterService/**
+```
+
+If you already have these routes, retain their existing IDs, predicates, filters, and path-rewriting behavior. Change only the backend URI if necessary.
+
+If your microservices run on different servers, use their internal IP addresses or hostnames instead of `127.0.0.1`.
+
+### Important network recommendation
+
+Because the backend services will continue to use HTTP, restrict their ports so they cannot be accessed directly by unauthorized users.
+
+For example, where the architecture permits it:
+
+- Allow external clients to reach the Gateway's HTTPS port.
+- Allow the Gateway to reach the backend service ports.
+- Restrict backend service ports from direct external access.
+- Avoid exposing ports `8081`, `8082`, and other internal service ports publicly.
+
+This is particularly important because the internal Gateway-to-service traffic will not be encrypted.
+
+---
+
+# Step 8: Open the Gateway HTTPS Port
+
+Your Gateway listens on port `8443` in this example.
+
+Ensure that the server firewall and any network firewall permit inbound traffic to that port from the intended clients.
+
+On Ubuntu, if UFW is used:
+
+```bash
+sudo ufw status
+```
+
+If you need to allow port 8443:
+
+```bash
+sudo ufw allow 8443/tcp
+```
+
+Only open the port if required by your network policy. Also configure any cloud, data-center, or perimeter firewall that applies.
+
+If you use port `443` instead, update the application and network configuration accordingly. Ports below 1024 may require additional privileges or a reverse proxy, depending on how your application is deployed.
+
+---
+
+# Step 9: Restart and Test the Gateway
+
+Restart the Gateway using your normal deployment method.
+
+If you run the JAR manually, make sure the password environment variable is available in the terminal where the application starts.
+
+Check the application logs for SSL or keystore errors.
+
+### 9.1 Test the HTTPS handshake
+
+From a machine with OpenSSL, run:
+
+```bash
+openssl s_client \
+  -connect YOUR_GATEWAY_HOSTNAME:8443 \
+  -servername YOUR_GATEWAY_HOSTNAME
+```
+
+Replace `YOUR_GATEWAY_HOSTNAME` with the hostname used by your clients.
+
+This lets you inspect the TLS handshake and the certificate presented by the Gateway.
+
+### 9.2 Test certificate validation
+
+If the Gateway certificate is signed by your internal CA:
+
+```bash
+curl --cacert /path/to/ca.crt \
+  https://YOUR_GATEWAY_HOSTNAME:8443/your-api-path
+```
+
+If the Gateway uses a directly trusted self-signed certificate, use that certificate as the trust anchor.
+
+Replace `/your-api-path` with an actual endpoint. If authentication is required, provide the appropriate credentials or token.
+
+Do not use `curl -k` as the final validation method because it disables certificate verification.
+
+### 9.3 Test backend routing
+
+Call the same API through the HTTPS Gateway and verify that the request reaches the correct HTTP backend service.
+
+For example:
+
+```text
+https://YOUR_GATEWAY_HOSTNAME:8443/authService/your-endpoint
+```
+
+The actual path depends on your Gateway routes.
+
+If the TLS handshake succeeds but the API returns an HTTP error, inspect the route configuration, backend availability, authentication rules, and path rewriting.
+
+---
+
+# Step 10: Update the Flutter Web Application
+
+Your Flutter Web application must call the Gateway using HTTPS.
+
+For example, if the Gateway hostname is `api.example.internal`:
+
+```dart
+const String apiBaseUrl = 'https://api.example.internal:8443';
+```
+
+Update your existing API configuration or HTTP client to use this base URL.
+
+**Do not use `localhost` or `127.0.0.1` in the deployed Flutter Web application** unless the API Gateway is intentionally running on each user's own computer. In a deployed application, those addresses refer to the user's computer, not your server.
+
+### If Tomcat hosts the Flutter Web application
+
+There are two possible arrangements:
+
+**Arrangement A: Flutter Web calls the Gateway directly**
+
+```text
+Browser ──HTTPS──> Tomcat (Flutter Web)
+Browser ──HTTPS──> API Gateway ──HTTP──> Microservices
+```
+
+In this arrangement, configure CORS if the frontend and Gateway use different origins.
+
+**Arrangement B: Tomcat or a reverse proxy forwards API requests**
+
+```text
+Browser ──HTTPS──> Tomcat / Reverse Proxy
+                         |
+                         | HTTPS
+                         v
+                    API Gateway
+                         |
+                         | HTTP
+                         v
+                    Microservices
+```
+
+In this arrangement, the proxy must validate the Gateway's certificate. If you already use a proxy, we should adapt its existing configuration rather than introduce another proxy unnecessarily.
+
+---
+
+# Step 11: Update the Flutter Mobile Application
+
+Your Flutter mobile application should also use the Gateway's HTTPS URL.
+
+For example:
+
+```dart
+const String apiBaseUrl = 'https://api.example.internal:8443';
+```
+
+Ensure that the hostname matches the Gateway certificate and that the mobile device can reach the server.
+
+### Important for self-signed certificates
+
+A certificate working on your development PC does not automatically mean it will be trusted by every mobile device.
+
+For a self-signed certificate or private CA, you must establish a suitable trust configuration for the supported Android and iOS devices.
+
+Do not disable certificate validation in Flutter to work around trust errors.
+
+If your organization manages the mobile devices, distributing trust for an approved internal CA may be an option. Otherwise, consider obtaining a certificate from a CA trusted by your target devices.
+
+---
+
+# Step 12: Configure CORS If Necessary
+
+If Flutter Web and the Gateway use different origins, configure the Gateway to allow the actual frontend origin.
+
+For example:
+
+```text
+Frontend: https://app.example.internal
+Gateway:  https://api.example.internal:8443
+```
+
+These are different origins because their hostnames and ports differ.
+
+Allow the frontend origin in your existing Spring Cloud Gateway CORS configuration. If Spring Security is configured in the Gateway, ensure that CORS is configured consistently with the security filter chain.
+
+Do not use a wildcard origin when credentials are enabled.
+
+CORS applies to browser requests; it is not normally enforced by native Flutter mobile HTTP clients in the same way.
+
+---
+
+# Step 13: What About Eureka and the Other Microservices?
+
+You do not need to enable HTTPS on Eureka or every microservice just because the Gateway uses HTTPS.
+
+For your chosen design:
+
+| Component | Protocol |
+|---|---|
+| Flutter Web → Tomcat | HTTPS |
+| Flutter Web → Gateway | HTTPS, if called directly |
+| Flutter Mobile → Gateway | HTTPS |
+| Tomcat/reverse proxy → Gateway | HTTPS, if proxying requests |
+| Gateway → Auth Service | HTTP |
+| Gateway → Master Service | HTTP |
+| Gateway → Other Microservices | HTTP |
+| Eureka | Existing configuration, unless separately secured |
+
+If your Gateway uses Eureka to discover backend services, check how the registered service URLs are constructed. Ensure they still resolve to the intended HTTP backend endpoints.
+
+Also, do not assume that securing the Gateway automatically secures Eureka communication.
+
+---
+
+# Step 14: Troubleshooting
+
+| Problem | What to check |
+|---|---|
+| `openssl` is not recognized | OpenSSL installation and Windows `PATH` |
+| `keystore password was incorrect` | Keystore password and file integrity |
+| `Alias name gateway does not identify a key entry` | Keystore alias |
+| `SSLHandshakeException` | Certificate trust, validity, hostname, and TLS configuration |
+| Browser reports certificate invalid | Certificate SAN, trust chain, and expiry |
+| Flutter Web shows a CORS error | Gateway CORS configuration and frontend origin |
+| Gateway returns `502 Bad Gateway` | Backend availability, HTTP route URI, port, and routing |
+| Mobile application cannot connect | DNS, firewall, certificate trust, hostname, and server reachability |
+| Gateway cannot read the keystore | File path and Linux permissions |
+
+---
+
+# Final Checklist
+
+Before considering the configuration complete, verify the following:
+
+- [ ] The certificate covers the API Gateway hostname.
+- [ ] The certificate and private key match.
+- [ ] The PKCS12 keystore has been created successfully.
+- [ ] The keystore has been transferred securely to the server.
+- [ ] The keystore password is supplied securely.
+- [ ] HTTPS is enabled on the Spring Cloud API Gateway.
+- [ ] Gateway routes use HTTP for the backend microservices.
+- [ ] Backend service ports are not unnecessarily exposed externally.
+- [ ] Flutter Web uses the HTTPS Gateway URL.
+- [ ] Flutter Mobile uses the HTTPS Gateway URL.
+- [ ] Clients trust the Gateway certificate.
+- [ ] CORS is configured if required.
+- [ ] The complete API flow has been tested.
+
+## Before you execute these steps, please confirm two details
+
+**1. What hostname do you use to access the server?**
+
+For example:
+- A domain name such as `app.example.com`
+- A private IP such as `192.168.1.100`
+- A public IP address
+- `localhost`
+
+**2. How is your API Gateway currently accessed?**
+
+For example:
+
+```text
+http://192.168.1.100:8080
+```
+
+Also, is your Gateway running on the same Linux server as Tomcat, or on a different server?
+
+These details will determine whether your existing certificate can be used and what exact URL and port you should configure in Flutter.
