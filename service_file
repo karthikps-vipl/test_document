@@ -1,0 +1,167 @@
+Your server is running **Red Hat Enterprise Linux 9.5 with systemd 252**, and `systemd-creds` is installed. That gives us the tools to implement a production-oriented secrets configuration.
+
+For your Spring Boot `authService`, I recommend using **systemd encrypted credentials + Spring Boot's `configtree:` configuration import**.
+
+We'll protect the PostgreSQL password, JWT secret, and internal synchronization token without putting their values in `application.properties` or the service unit.
+
+One important detail: because your systemd version is 252, we should verify the available credential options and configure encryption appropriately for your server. We should also test that credentials remain available after a reboot before relying on them in production.
+
+## 1. Verify TPM availability and credential support
+
+Run:
+
+```bash
+sudo systemd-creds has-tpm2
+```
+
+This reports whether systemd can use a TPM 2.0 device for credential encryption.
+
+Also check the available encryption modes:
+
+```bash
+systemd-creds encrypt --help
+```
+
+Systemd 252 supports `LoadCredentialEncrypted=`. Its encryption can use a TPM, a host key stored under `/var/lib/systemd/`, or a combination, depending on availability and configuration. [Freedesktop](https://www.freedesktop.org/software/systemd/man/252/systemd-creds.html?utm_source=chatgpt.com)
+
+## 2. Create the encrypted credential files
+
+Create the directory:
+
+```bash
+sudo install -d -o root -g root -m 700 /etc/credstore.encrypted
+```
+
+For the database password, you can encrypt the value directly from a password prompt, avoiding a temporary plaintext file:
+
+```bash
+sudo sh -c 'systemd-ask-password -n "PostgreSQL password:" | systemd-creds encrypt --name=spring.datasource.password - /etc/credstore.encrypted/laa-db-password'
+```
+
+For your JWT secret, generate a new random secret and encrypt it directly:
+
+```bash
+sudo sh -c 'openssl rand -base64 48 | systemd-creds encrypt --name=app.jwt.secret - /etc/credstore.encrypted/laa-jwt-secret'
+```
+
+For the internal synchronization token:
+
+```bash
+sudo sh -c 'openssl rand -hex 32 | systemd-creds encrypt --name=sync.internal-token - /etc/credstore.encrypted/laa-sync-token'
+```
+
+These commands do not print the secret values to the terminal. The JWT and synchronization tokens will be generated automatically.
+
+**Important:** Save the generated JWT secret and synchronization token securely if other applications or nodes need to share them. For an existing deployment, plan the rotation carefully so that all participating services use compatible credentials.
+
+Restrict the encrypted files:
+
+```bash
+sudo chown root:root /etc/credstore.encrypted/laa-*
+sudo chmod 600 /etc/credstore.encrypted/laa-*
+```
+
+## 3. Update Spring Boot
+
+In `/opt/laa_backend/application.properties`—or wherever your application configuration is maintained—add:
+
+```properties
+spring.config.import=configtree:${CREDENTIALS_DIRECTORY}/
+```
+
+Remove the hardcoded values for:
+
+```properties
+spring.datasource.password=...
+app.jwt.secret=...
+sync.internal-token=...
+```
+
+Do not add defaults for these required secrets.
+
+Spring Boot's configuration-tree support maps filenames to property names, so the credentials named `spring.datasource.password`, `app.jwt.secret`, and `sync.internal-token` become available to the application. [Home](https://docs.spring.io/spring-boot/reference/features/external-config.html?utm_source=chatgpt.com)
+
+## 4. Update the systemd service
+
+In `/etc/systemd/system/laa-node.service`, use:
+
+```ini
+[Unit]
+Description=Laa Node Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=Laatcs
+WorkingDirectory=/opt/laa_backend
+
+Environment="JAVA_HOME=/usr/lib/jvm/jdk-21.0.7-oracle-x64"
+
+LoadCredentialEncrypted=spring.datasource.password:/etc/credstore.encrypted/laa-db-password
+LoadCredentialEncrypted=app.jwt.secret:/etc/credstore.encrypted/laa-jwt-secret
+LoadCredentialEncrypted=sync.internal-token:/etc/credstore.encrypted/laa-sync-token
+
+ExecStart=/usr/lib/jvm/jdk-21.0.7-oracle-x64/bin/java -jar /opt/laa_backend/authService-0.0.1-SNAPSHOT.jar
+
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+This uses the credential names embedded during encryption and makes the decrypted values available to the service through systemd's credential directory.
+
+Before using the additional hardening options in production, test that they do not interfere with your application or its required integrations.
+
+## 5. Restart and test
+
+Reload the service configuration:
+
+```bash
+sudo systemctl daemon-reload
+```
+
+Restart the service:
+
+```bash
+sudo systemctl restart laa-node
+```
+
+Check its status:
+
+```bash
+sudo systemctl status laa-node
+```
+
+Review recent logs:
+
+```bash
+sudo journalctl -u laa-node -n 100 --no-pager
+```
+
+If startup fails, check the credential-loading and Spring configuration errors first. Do not print secrets to the logs.
+
+### Before deploying
+
+I recommend completing these two checks:
+
+1. **Reboot recovery:** Confirm the credentials can still be decrypted after a controlled reboot. Keep a secure recovery procedure for the host encryption key and encrypted files.
+2. **Application compatibility:** Verify that the application starts, connects to PostgreSQL, validates JWTs, and performs node synchronization correctly before switching production traffic.
+
+This approach keeps the secret values out of your JAR, `application.properties`, and the service unit. It also provides stronger protection for stored credentials than ordinary environment variables, although it cannot protect a secret from a fully compromised application process.
+
+
+
+
+https://www.manageengine.com/mobile-device-management/api/devices/#overview
