@@ -1,0 +1,287 @@
+I have reviewed your uploaded `notificationService` code. I can see a few issues in the Socket.IO implementation that could explain why `/send_private` works but group notifications sometimes cause the mobile socket to disconnect.
+
+**My initial observation: The problem is more likely in the group notification handling and socket connection management than in the actual message payload.**
+
+There are three important differences/issues in your current implementation.
+
+## 1. Problem in `onFenceEvent()` – Missing null check
+
+Your current code:
+
+```java
+SocketIOClient ownerSocket = connectedUsers.get(ownerUserId);
+
+GroupNotificationPayload alert = new GroupNotificationPayload(
+        "User " + payload.getUserId() + " has " + payload.getType() + "ED the geofence",
+        payload.getUserId(), payload.getType(), groupId,
+        payload.getLatitude(), payload.getLongitude());
+
+ownerSocket.sendEvent("groupNotification", alert);
+```
+
+You have commented out the null check:
+
+```java
+// if (ownerSocket != null) {
+```
+
+This is dangerous.
+
+If the group owner is not connected, `ownerSocket` will be null. Calling `sendEvent()` on it will throw a `NullPointerException`.
+
+Restore the null check.
+
+## 2. Your `connectedUsers` map has a connection-management problem
+
+Currently:
+
+```java
+private final Map<Long, SocketIOClient> connectedUsers = new ConcurrentHashMap<>();
+```
+
+And during registration:
+
+```java
+connectedUsers.put(userId, client);
+```
+
+This works for basic one-to-one notifications, but there is a potential race condition.
+
+Consider this scenario:
+
+1. Mobile user 101 connects using socket A.
+2. User 101 registers. `connectedUsers` contains socket A.
+3. Due to a network reconnect, socket B connects.
+4. User 101 registers again. `connectedUsers` now contains socket B.
+5. Socket A disconnects.
+6. Your `onDisconnect()` executes:
+
+```java
+connectedUsers.remove(userId);
+```
+
+**Problem:** This removes socket B even though socket B is still connected!
+
+Now your server believes user 101 is disconnected, although the mobile application still has an active connection.
+
+This is an important bug that can affect both private and group notifications.
+
+### Correct your `onDisconnect()`
+
+Use conditional removal:
+
+```java
+@OnDisconnect
+public void onDisconnect(SocketIOClient client) {
+
+    Long userId = client.get("userId");
+
+    if (userId != null) {
+
+        // Remove only if the currently registered socket
+        // is the same socket that disconnected.
+        connectedUsers.remove(userId, client);
+
+        log.info("Socket disconnected for user: {}, Session: {}",
+                userId, client.getSessionId());
+    }
+}
+```
+
+`remove(userId, client)` removes the entry only when both the user ID and socket instance match.
+
+This is an important correction.
+
+## 3. Your `recentEvents` implementation has another issue
+
+Currently:
+
+```java
+private final Set<Long> recentEvents = ConcurrentHashMap.newKeySet();
+```
+
+And:
+
+```java
+Long eventKey = payload.getUserId();
+
+if (recentEvents.contains(eventKey))
+    return;
+
+recentEvents.add(eventKey);
+```
+
+Once a user sends their first fence event, that user ID remains in `recentEvents` permanently.
+
+Consequently, subsequent notifications from that user will be ignored.
+
+You should not use only `userId` as the duplicate identifier.
+
+If you need duplicate prevention, use a unique event ID or a combination of user ID, event type, group ID and an appropriate time window.
+
+For now, I recommend temporarily removing this duplicate-prevention logic while debugging the socket disconnection.
+
+## 4. Recommended corrected `onFenceEvent()`
+
+I recommend replacing your existing method with this version first.
+
+```java
+@OnEvent("fenceEvent")
+public void onFenceEvent(
+        SocketIOClient client,
+        FenceEventPayload payload,
+        AckRequest ackRequest) {
+
+    try {
+
+        log.info("FENCE EVENT RECEIVED: {}", payload);
+
+        if (payload.getUserId() == null || payload.getType() == null) {
+            log.warn("Invalid fence event payload");
+            return;
+        }
+
+        GroupOwnerProjection activeGroup =
+                notificationRepository
+                .findActiveGroupByMemberId(payload.getUserId())
+                .orElse(null);
+
+        if (activeGroup == null) {
+            log.warn("No active group found for user {}",
+                    payload.getUserId());
+            return;
+        }
+
+        Long ownerUserId = activeGroup.getOwnerUserId();
+        Integer groupId = activeGroup.getGroupId();
+
+        SocketIOClient ownerSocket = connectedUsers.get(ownerUserId);
+
+        if (ownerSocket == null) {
+
+            log.warn("Group owner {} is not connected. Group ID: {}",
+                    ownerUserId, groupId);
+
+            return;
+        }
+
+        if (!ownerSocket.isChannelOpen()) {
+
+            log.warn("Socket channel is closed for owner {}",
+                    ownerUserId);
+
+            connectedUsers.remove(ownerUserId, ownerSocket);
+            return;
+        }
+
+        GroupNotificationPayload alert =
+                new GroupNotificationPayload(
+                        "User " + payload.getUserId()
+                                + " has " + payload.getType()
+                                + "ED the geofence",
+                        payload.getUserId(),
+                        payload.getType(),
+                        groupId,
+                        payload.getLatitude(),
+                        payload.getLongitude()
+                );
+
+        log.info("Sending groupNotification to owner: {}, Session: {}",
+                ownerUserId, ownerSocket.getSessionId());
+
+        ownerSocket.sendEvent("groupNotification", alert);
+
+        log.info("Group notification dispatched successfully to owner {}",
+                ownerUserId);
+
+    } catch (Exception e) {
+
+        log.error("Error processing fence event for user {}",
+                payload.getUserId(), e);
+    }
+}
+```
+
+Also update `onDisconnect()` as explained earlier.
+
+## 5. One more important thing: Your Socket.IO server configuration
+
+Your current configuration:
+
+```java
+config.setHostname("0.0.0.0");
+config.setPort(8082);
+config.setOrigin("*");
+```
+
+There are two things to consider:
+
+- Your Spring Boot HTTP server uses `server.port=0`, but Socket.IO independently listens on port `8082`.
+- If you deploy multiple notification service instances on the same machine, they cannot all bind to the same Socket.IO port.
+
+If you are running multiple instances behind Eureka/API Gateway, you also need to consider how Socket.IO connections are routed between instances.
+
+Your `connectedUsers` map is local to each application instance. It is not shared between instances.
+
+For now, if you are testing with one notification service instance, keep this architecture unchanged.
+
+---
+
+## 6. What I want you to check during the next test
+
+Add these logs:
+
+**During registration:**
+
+```java
+log.info("USER REGISTERED: {}, SESSION: {}, TOTAL CONNECTIONS: {}",
+        userId, client.getSessionId(), connectedUsers.size());
+```
+
+**Before sending group notification:**
+
+```java
+log.info("GROUP NOTIFICATION: Owner: {}, Socket Connected: {}, Session: {}",
+        ownerUserId,
+        ownerSocket != null,
+        ownerSocket != null ? ownerSocket.getSessionId() : null);
+```
+
+**During disconnection:**
+
+```java
+log.info("SOCKET DISCONNECTED: Session: {}, User: {}",
+        client.getSessionId(),
+        client.get("userId"));
+```
+
+These logs will help establish whether the socket disconnects before the server attempts to send the event or whether the send operation itself encounters an error.
+
+---
+
+## 7. One clarification about your endpoints
+
+In your uploaded code, I noticed:
+
+| Endpoint / Event | Purpose |
+|---|---|
+| `/send_private` | Sends a targeted notification |
+| `/group_notification` | GET API that fetches group notification history |
+| `fenceEvent` | Socket event received from mobile |
+| `groupNotification` | Socket event sent to group owner |
+
+So the actual group notification delivery happens inside `fenceEvent`, not through the `/group_notification` GET endpoint.
+
+### My recommendation
+
+Before changing your architecture, I would like to establish one thing.
+
+**When you say the mobile socket disconnects during group notification, which of these happens?**
+
+1. The mobile socket disconnects immediately when `fenceEvent` is triggered, even before `ownerSocket.sendEvent()` executes.
+2. The socket disconnects exactly when `ownerSocket.sendEvent("groupNotification", alert)` executes.
+3. The socket remains connected on the server, but the Android application reports a disconnection.
+
+This distinction is very important.
+
+I don't recommend replacing Socket.IO, changing your notification architecture, or introducing Redis at this stage. First, let's identify why the existing connection is dropping.
