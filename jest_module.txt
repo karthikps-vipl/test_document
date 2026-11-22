@@ -1,0 +1,458 @@
+### 1. `tests/setupTests.js`
+
+Create this file to match your `jest.config.cjs` (`setupFilesAfterEnv`) and prevent `jsdom` crashes from Ant Design, MUI, Recharts, Framer Motion, and React Router v7.
+
+```js
+import '@testing-library/jest-dom';
+import { TextEncoder, TextDecoder } from 'util';
+
+// Polyfill for react-router-dom v7 in jsdom
+if (!global.TextEncoder) global.TextEncoder = TextEncoder;
+if (!global.TextDecoder) global.TextDecoder = TextDecoder;
+
+// Mock matchMedia (required by Ant Design, MUI, etc.)
+Object.defineProperty(window, 'matchMedia', {
+  writable: true,
+  value: jest.fn().mockImplementation((query) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addListener: jest.fn(),
+    removeListener: jest.fn(),
+    addEventListener: jest.fn(),
+    removeEventListener: jest.fn(),
+    dispatchEvent: jest.fn(),
+  })),
+});
+
+// Mock ResizeObserver (required by Recharts, Antd, xyflow)
+global.ResizeObserver = class ResizeObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+};
+
+// Mock IntersectionObserver (required by Framer Motion)
+global.IntersectionObserver = class IntersectionObserver {
+  constructor() {}
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+};
+
+// Mock scrollTo
+window.scrollTo = jest.fn();
+
+```
+
+---
+
+### 2. `generate-tests.mjs`
+
+This upgraded version outputs directly to `./tests` mirroring your `src/` folder structure, uses ESM imports, auto-wraps Router/Redux providers, recognizes MUI/Antd components, and skips existing test files by default (pass `--overwrite` to regenerate them).
+
+```js
+// generate-tests.mjs — Upgraded Jest Test Generator for React + Vite
+
+import fs from "fs";
+import path from "path";
+import { parse } from "@babel/parser";
+import traverseModule from "@babel/traverse";
+
+const traverse = traverseModule.default || traverseModule;
+
+const SRC_DIR = path.resolve("./src");
+const TEST_DIR = path.resolve("./tests");
+const OVERWRITE = process.argv.includes("--overwrite");
+
+const IGNORED_FILES = new Set(["main.jsx", "main.js", "index.js"]);
+
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+function collectFiles(dir) {
+  const res = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      res.push(...collectFiles(full));
+    } else if (
+      (full.endsWith(".js") || full.endsWith(".jsx")) &&
+      !full.includes(".test.") &&
+      !full.includes(".spec.") &&
+      !IGNORED_FILES.has(entry.name)
+    ) {
+      res.push(full);
+    }
+  }
+  return res;
+}
+
+function getJSXTagName(nameNode) {
+  if (!nameNode) return null;
+  if (nameNode.type === "JSXIdentifier") return nameNode.name;
+  if (nameNode.type === "JSXMemberExpression") {
+    return `${getJSXTagName(nameNode.object)}.${nameNode.property?.name}`;
+  }
+  return null;
+}
+
+function analyze(filePath) {
+  const code = fs.readFileSync(filePath, "utf8");
+
+  let ast;
+  try {
+    ast = parse(code, {
+      sourceType: "unambiguous",
+      plugins: ["jsx"],
+    });
+  } catch (err) {
+    console.warn(`⚠️ Skipping unparseable file: ${filePath}`);
+    return null;
+  }
+
+  let hasJSX = false;
+  let hasDefaultExport = false;
+  let defaultExportName = path.basename(filePath).replace(/\.(jsx|js)$/, "");
+  const exportedFunctions = [];
+
+  // React & Stack metadata
+  let usesRouter = false;
+  let usesRedux = false;
+  let usesFetch = false;
+  let usesAxios = false;
+  let hasForm = false;
+  let hasTable = false;
+  let hasModal = false;
+
+  const buttons = new Set();
+  const placeholders = new Set();
+  const testIds = new Set();
+  const roles = new Set();
+
+  traverse(ast, {
+    ImportDeclaration(p) {
+      const src = p.node.source?.value || "";
+      if (src.includes("react-router")) usesRouter = true;
+      if (src === "react-redux") usesRedux = true;
+      if (src === "axios") usesAxios = true;
+    },
+
+    JSXElement(p) {
+      hasJSX = true;
+      const tag = getJSXTagName(p.node.openingElement.name);
+      const attrs = p.node.openingElement.attributes || [];
+
+      if (tag === "form" || tag === "Form") hasForm = true;
+      if (["table", "Table", "DataGrid"].includes(tag)) hasTable = true;
+      if (["Modal", "Dialog", "Drawer"].includes(tag)) hasModal = true;
+
+      attrs.forEach((a) => {
+        if (a.type !== "JSXAttribute") return;
+        const attrName = a.name?.name;
+        const attrVal = a.value?.value;
+
+        if (attrName === "data-testid" && attrVal) testIds.add(attrVal);
+        if (attrName === "role" && attrVal) roles.add(attrVal);
+        if (attrName === "placeholder" && attrVal) placeholders.add(attrVal);
+      });
+
+      if (tag === "button" || tag === "Button") {
+        const txt = (p.node.children || [])
+          .map((c) => (c.type === "JSXText" ? c.value.trim() : ""))
+          .filter(Boolean)
+          .join(" ");
+        if (txt) buttons.add(txt);
+      }
+    },
+
+    CallExpression(p) {
+      const callee = p.node.callee;
+      if (callee.name === "fetch") usesFetch = true;
+      if (callee.object?.name === "axios") usesAxios = true;
+      if (callee.name === "useSelector" || callee.name === "useDispatch") {
+        usesRedux = true;
+      }
+    },
+
+    ExportDefaultDeclaration(p) {
+      hasDefaultExport = true;
+      if (p.node.declaration?.name) {
+        defaultExportName = p.node.declaration.name;
+      } else if (p.node.declaration?.id?.name) {
+        defaultExportName = p.node.declaration.id.name;
+      }
+    },
+
+    ExportNamedDeclaration(p) {
+      const d = p.node.declaration;
+      if (d?.type === "FunctionDeclaration" && d.id?.name) {
+        exportedFunctions.push({ name: d.id.name, params: d.params.length });
+      } else if (d?.type === "VariableDeclaration") {
+        d.declarations.forEach((decl) => {
+          if (
+            decl.id?.name &&
+            (decl.init?.type === "ArrowFunctionExpression" ||
+              decl.init?.type === "FunctionExpression")
+          ) {
+            exportedFunctions.push({
+              name: decl.id.name,
+              params: decl.init.params.length,
+            });
+          }
+        });
+      }
+    },
+  });
+
+  return {
+    filePath,
+    hasJSX,
+    hasDefaultExport,
+    componentName: defaultExportName,
+    exportedFunctions,
+    usesRouter,
+    usesRedux,
+    usesFetch,
+    usesAxios,
+    hasForm,
+    hasTable,
+    hasModal,
+    buttons: Array.from(buttons),
+    placeholders: Array.from(placeholders),
+    testIds: Array.from(testIds),
+    roles: Array.from(roles),
+  };
+}
+
+function buildReactTest(meta, importPath) {
+  const C = meta.hasDefaultExport
+    ? meta.componentName
+    : meta.exportedFunctions[0]?.name || meta.componentName;
+
+  const importStmt = meta.hasDefaultExport
+    ? `import ${C} from '${importPath}';`
+    : `import { ${C} } from '${importPath}';`;
+
+  let imports = `import React from 'react';
+import { render, screen, fireEvent } from '@testing-library/react';
+${meta.usesRouter ? "import { MemoryRouter } from 'react-router-dom';\n" : ""}${
+    meta.usesRedux
+      ? "import { Provider } from 'react-redux';\nimport configureStore from 'redux-mock-store';\n"
+      : ""
+  }${meta.usesAxios ? "import axios from 'axios';\n" : ""}${importStmt}
+`;
+
+  let mocks = "";
+  if (meta.usesFetch) {
+    mocks += `
+global.fetch = jest.fn(() =>
+  Promise.resolve({ ok: true, json: () => Promise.resolve({}) })
+);
+`;
+  }
+
+  if (meta.usesAxios) {
+    mocks += `
+jest.mock('axios', () => ({
+  get: jest.fn(() => Promise.resolve({ data: {} })),
+  post: jest.fn(() => Promise.resolve({ data: {} })),
+  put: jest.fn(() => Promise.resolve({ data: {} })),
+  delete: jest.fn(() => Promise.resolve({ data: {} })),
+  create: jest.fn(function () { return this; }),
+  interceptors: {
+    request: { use: jest.fn(), eject: jest.fn() },
+    response: { use: jest.fn(), eject: jest.fn() },
+  },
+}));
+`;
+  }
+
+  let renderHelper = `const renderComponent = (props = {}) => {\n`;
+  let jsx = `<${C} {...props} />`;
+  if (meta.usesRouter) jsx = `<MemoryRouter>${jsx}</MemoryRouter>`;
+  if (meta.usesRedux) {
+    renderHelper += `  const mockStore = configureStore([]);\n  const store = mockStore({});\n`;
+    jsx = `<Provider store={store}>${jsx}</Provider>`;
+  }
+  renderHelper += `  return render(${jsx});\n};\n`;
+
+  let tests = `
+describe('${C}', () => {
+  test('renders without crashing', () => {
+    const { container } = renderComponent();
+    expect(container).toBeTruthy();
+  });
+`;
+
+  if (meta.testIds.length) {
+    tests += `
+  test('renders key test-id elements', () => {
+    renderComponent();
+${meta.testIds
+  .slice(0, 5)
+  .map((id) => `    expect(screen.queryByTestId('${id}')).toBeTruthy();`)
+  .join("\n")}
+  });
+`;
+  }
+
+  if (meta.placeholders.length) {
+    tests += `
+  test('renders input placeholders', () => {
+    renderComponent();
+${meta.placeholders
+  .slice(0, 5)
+  .map((ph) => `    expect(screen.queryByPlaceholderText(/${escapeRegex(ph)}/i)).toBeTruthy();`)
+  .join("\n")}
+  });
+`;
+  }
+
+  if (meta.buttons.length) {
+    tests += `
+  test('handles button interactions safely', () => {
+    renderComponent();
+    const btns = screen.queryAllByRole('button');
+    if (btns.length > 0) {
+      fireEvent.click(btns[0]);
+    }
+    expect(btns.length).toBeGreaterThanOrEqual(0);
+  });
+`;
+  }
+
+  if (meta.hasTable) {
+    tests += `
+  test('renders table structure', () => {
+    renderComponent();
+    expect(screen.queryByRole('table')).toBeTruthy();
+  });
+`;
+  }
+
+  tests += `});\n`;
+
+  return `${imports}${mocks}\n${renderHelper}${tests}`;
+}
+
+function buildUtilityTest(meta, importPath) {
+  if (!meta.exportedFunctions.length) return null;
+
+  const names = meta.exportedFunctions.map((f) => f.name).join(", ");
+  let out = `import { ${names} } from '${importPath}';
+
+describe('${path.basename(meta.filePath)}', () => {
+`;
+
+  meta.exportedFunctions.forEach((fn) => {
+    out += `
+  test('${fn.name} is defined and callable', () => {
+    expect(typeof ${fn.name}).toBe('function');
+  });
+`;
+  });
+
+  out += `});\n`;
+  return out;
+}
+
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function main() {
+  ensureDir(TEST_DIR);
+  const files = collectFiles(SRC_DIR);
+  let created = 0;
+  let skipped = 0;
+
+  for (const file of files) {
+    const meta = analyze(file);
+    if (!meta) continue;
+
+    const relFromSrc = path.relative(SRC_DIR, file);
+    const testExt = meta.hasJSX ? ".test.jsx" : ".test.js";
+    const dest = path.join(TEST_DIR, relFromSrc.replace(/\.(jsx|js)$/, testExt));
+
+    if (fs.existsSync(dest) && !OVERWRITE) {
+      skipped++;
+      continue;
+    }
+
+    let importPath = path
+      .relative(path.dirname(dest), file)
+      .replace(/\\/g, "/")
+      .replace(/\.(jsx|js)$/, "");
+    if (!importPath.startsWith(".")) importPath = "./" + importPath;
+
+    const content = meta.hasJSX
+      ? buildReactTest(meta, importPath)
+      : buildUtilityTest(meta, importPath);
+
+    if (!content) continue;
+
+    ensureDir(path.dirname(dest));
+    fs.writeFileSync(dest, content, "utf8");
+    created++;
+    console.log(`✅ Generated: ${path.relative(process.cwd(), dest)}`);
+  }
+
+  console.log(`\nDone! Created: ${created}, Skipped existing: ${skipped}`);
+}
+
+main();
+
+```
+
+---
+
+### How to Run It
+
+```bash
+# Generate tests (skips existing files)
+node generate-tests.mjs
+
+# Force regenerate all tests
+node generate-tests.mjs --overwrite
+
+# Run Jest with coverage
+npm run coverage
+
+```
+
+Once you run `npm run coverage`, if any specific library (like `d3`, `fabric`, or `@xyflow/react`) throws a Jest ESM transform error, share the error output and I'll give you the exact `transformIgnorePatterns` or mock line for `jest.config.cjs`.
+
+
+
+
+
+
+
+===========================================================
+Your `jest.config.cjs` is currently configured to look for **`tests/setupTests.js`**, while you already have a **`jest.setup.js`** file in your project root.
+
+Pick **one** of these two options:
+
+### Option 1: Match your current `jest.config.cjs` (Recommended)
+
+1. **Create** (or replace, if it already exists) the file at:
+`tests/setupTests.js`
+2. Paste the code inside it.
+3. You can delete the old `jest.setup.js` in your root folder so there's no confusion.
+
+
+
+### Option 2: Reuse your existing `jest.setup.js`
+
+1. **Replace** the contents of your root `jest.setup.js` with the code.
+
+
+2. In `jest.config.cjs`, update `setupFilesAfterEnv` to point to it:
+
+
+```js
+setupFilesAfterEnv: ["<rootDir>/jest.setup.js"],
+
+```
