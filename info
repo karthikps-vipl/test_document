@@ -1,0 +1,41 @@
+When roads appear visually on your map layer but are completely ignored by the shortest path algorithm, it means those road lines are "disconnected" in the routing graph—usually because they cross other roads without a shared vertex (node) at the intersection, or their cost column is NULL or negative.
+Visual lines touching on a GeoServer map does not mean pgRouting knows they are connected. pgRouting only connects roads at their exact start and end points (source and target).
+
+The 4 Most Common Causes & Fixes
+
+
+1. Roads Cross Without Splitting (Missing Intersection Nodes)
+
+In many shapefiles, a long main road is drawn as a single continuous line from start to finish, and side streets touch the middle of it. Because there is no vertex/endpoint break on the main road where the side street meets it, cars cannot "turn" onto or off that road.
+* How to fix: Run pgr_nodeNetwork to automatically split lines wherever they intersect, then rebuild your topology:sql
+-- 1. Split all intersecting lines (creates a 'roads_noded' table)
+SELECT pgr_nodeNetwork('roads', 0.00001, 'id', 'geom');
+
+-- 2. Build topology on the newly split table
+SELECT pgr_createTopology('roads_noded', 0.00001, 'geom', 'id');
+Use code with caution.
+(Note: After running pgr_nodeNetwork, copy over your road attributes/costs from roads to roads_noded using old_id, and point your GeoServer SQL View to roads_noded.)
+
+2. NULL or 0 Values in cost / reverse_cost
+
+If you added new roads or converted a shapefile where some geometries were empty or failed length calculation, cost might be NULL. pgRouting completely skips any road segment where cost IS NULL.
+* How to check:sql
+SELECT COUNT(*) FROM roads WHERE cost IS NULL OR source IS NULL OR target IS NULL;
+Use code with caution.
+* How to fix: Recalculate costs for all rows:sql
+UPDATE roads SET cost = ST_Length(geom::geography), reverse_cost = ST_Length(geom::geography);
+Use code with caution.
+
+3. Micro-Gaps Larger Than Your Tolerance (0.00001)
+
+If a side street stops 2 or 3 meters short of the main road in your shapefile, 0.00001 (~1.1 meters) won't snap them together, leaving that road isolated.
+* How to check: Look at the roads_vertices_pgr table in QGIS or GeoServer. Every valid intersection should have a vertex point (cnt >= 2). If an intersection has a point with cnt = 1 (colored red in standard pgRouting checks), it is a disconnected dead end.
+* How to fix: Re-run pgr_createTopology with a slightly larger tolerance (e.g., 0.00005 ≈ 5.5 meters) to bridge sloppy digitization gaps:sql
+SELECT pgr_createTopology('roads', 0.00005, 'geom', 'id', clean := true);
+Use code with caution.
+
+4. Incorrect One-Way Rules Blocking Entry
+
+If the missing roads have cost = -1 or reverse_cost = -1 (for example, from an OpenStreetMap oneway tag conversion bug), pgRouting treats them as closed streets.
+* How to check: Run SELECT COUNT(*) FROM roads WHERE cost < 0 AND reverse_cost < 0; to see if roads are accidentally blocked in both directions.
+
